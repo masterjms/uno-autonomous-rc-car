@@ -43,23 +43,12 @@ AF_DCMotor motorRight(4);
 
 /*
   모터 방향 보정
-
-  setMotor(150, 150)을 실행했을 때:
-  - 둘 다 전진하면 그대로 0
-  - 왼쪽만 후진하면 LEFT_MOTOR_INVERT = 1
-  - 오른쪽만 후진하면 RIGHT_MOTOR_INVERT = 1
 */
 const uint8_t LEFT_MOTOR_INVERT  = 0;
 const uint8_t RIGHT_MOTOR_INVERT = 0;
 
 /*
   좌우 모터 출력 보정
-
-  현재 테스트 결과:
-  - 오른쪽 바퀴 힘이 약함
-  - 직진 시 왼쪽으로 편향됨
-
-  따라서 오른쪽 모터에 +18 보정값을 적용한다.
 */
 const int LEFT_TRIM  = -10;
 const int RIGHT_TRIM = 35;
@@ -69,25 +58,15 @@ const int RIGHT_TRIM = 35;
 // =======================================================
 
 /*
-  이전 버전보다 전체 속도를 올림.
-
-  이유:
-  - 속도를 너무 낮추면 L293D + DC 모터 조합에서 기동 토크가 부족함
-  - 오른쪽 바퀴가 제대로 돌지 않음
-  - 직진 시 왼쪽으로 편향됨
-
-  단, 초기에 너무 빠르게 벽에 박는 문제가 있었으므로
-  원래 고속값까지는 올리지 않고 중간 수준으로 조정한다.
+  주행 속도는 거리별로 나누지 않고 하나로 통일한다.
 */
-const int HIGH_SPEED = 155;
-const int MID_SPEED  = 135;
-const int LOW_SPEED  = 115;
+const int DRIVE_SPEED = 155;
 
 /*
   회전과 후진도 토크 부족을 막기 위해 이전보다 올림.
 */
-const int TURN_SPEED = 130;
-const int BACK_SPEED = 115;
+const int TURN_SPEED = 155;
+const int BACK_SPEED = 130;
 
 // 모터 PWM 범위
 const int MOTOR_MIN = -255;
@@ -101,9 +80,7 @@ const int MOTOR_MAX = 255;
   시험 도로가 매우 좁고 짧기 때문에 거리 기준값은 작게 유지한다.
   이 값들은 현재 시험 환경에 맞춰 사용자가 직접 조정한 값이므로 변경하지 않는다.
 */
-const int EMERGENCY_DISTANCE = 2;   // 너무 가까움
-const int DANGER_DISTANCE    = 5;   // 회피 시작
-const int SLOW_DISTANCE      = 8;   // 감속 시작
+const int DANGER_DISTANCE    = 10;   // 회피 시작
 const int CLEAR_DISTANCE     = 12;  // 열린 공간 판단 기준
 
 const int MIN_VALID_DISTANCE = 2;
@@ -139,7 +116,7 @@ unsigned long lastSonarMs = 0;
 // 7. 상태 머신 시간값
 // =======================================================
 
-const unsigned long STOP_SETTLE_MS = 100;
+const unsigned long STOP_SETTLE_MS = 200;
 
 /*
   벽에 붙었을 때 짧게 후진해서 회전 공간을 만든다.
@@ -147,30 +124,15 @@ const unsigned long STOP_SETTLE_MS = 100;
 const unsigned long BACK_MS = 500;
 
 /*
-  회전 시간이 너무 짧으면 실제로는 30도 정도만 회전할 수 있으므로
-  회전 관련 시간을 길게 잡는다.
+  한쪽 바퀴만 움직여 약 90도 회전하는 시간.
+  실제 90도에 맞도록 주행 테스트하면서 이 값만 조정한다.
 */
-const unsigned long TURN_MIN_MS = 350;
-const unsigned long TURN_LEFT_MAX_MS = 950;
-const unsigned long TURN_RIGHT_MIN_MS = 500;
-const unsigned long TURN_RIGHT_MAX_MS = 1400;
-
-/*
-  열린 공간을 찾은 뒤 차체 폭 보정을 위해 추가 회전.
-*/
-const unsigned long TURN_MARGIN_MS = 150;
+const unsigned long PIVOT_TURN_MS = 700;
 
 /*
   회피 성공 후 전진 보장 시간.
 */
 const unsigned long ESCAPE_FORWARD_MS = 800;
-
-/*
-  긴급 탈출 루틴.
-*/
-const unsigned long FAIL_BACK_MS        = 850;
-const unsigned long FAIL_TURN_MS        = 2600;
-const unsigned long RECOVERY_FORWARD_MS = 600;
 
 // =======================================================
 // 8. 상태 정의
@@ -184,16 +146,13 @@ enum AutoState {
   ST_STOP_BEFORE_LEFT,
 
   ST_TURN_LEFT_SEARCH,
-  ST_LEFT_MARGIN,
+  ST_CHECK_LEFT,
+  ST_RETURN_CENTER_FROM_LEFT,
 
   ST_ESCAPE_FORWARD,
 
   ST_TURN_RIGHT_SEARCH,
-  ST_RIGHT_MARGIN,
-
-  ST_FAIL_BACK,
-  ST_FAIL_TURN,
-  ST_RECOVERY_FORWARD
+  ST_CHECK_RIGHT
 };
 
 AutoState state = ST_CRUISE;
@@ -225,19 +184,19 @@ void handleStopBeforeBack();
 void handleBack();
 void handleStopBeforeLeft();
 void handleTurnLeftSearch();
-void handleLeftMargin();
+void handleCheckLeft();
+void handleReturnCenterFromLeft();
 void handleEscapeForward();
 void handleTurnRightSearch();
-void handleRightMargin();
-void handleFailBack();
-void handleFailTurn();
-void handleRecoveryForward();
+void handleCheckRight();
 
 void setMotor(int left, int right);
 void setOneMotor(AF_DCMotor &motor, int signedSpeed, uint8_t invert);
 int applyTrim(int speed, int trim);
 void stopMotor();
 
+const __FlashStringHelper *stateName(AutoState currentState);
+void debugEvent(const __FlashStringHelper *message);
 void debugPrint();
 
 // =======================================================
@@ -285,8 +244,51 @@ void enterState(AutoState nextState) {
   dangerCount = 0;
 
 #if DEBUG_SERIAL
-  Serial.print(F("STATE -> "));
-  Serial.println((int)state);
+  Serial.print(F("상태 -> "));
+  Serial.print((int)state);
+  Serial.print(F(" "));
+  Serial.println(stateName(state));
+
+  switch (state) {
+    case ST_STOP_BEFORE_BACK:
+      debugEvent(F("장애물 감지!"));
+      break;
+
+    case ST_BACK:
+      debugEvent(F("후진"));
+      break;
+
+    case ST_TURN_LEFT_SEARCH:
+      debugEvent(F("왼쪽 회전..."));
+      break;
+
+    case ST_CHECK_LEFT:
+      debugEvent(F("왼쪽 거리 확인"));
+      break;
+
+    case ST_RETURN_CENTER_FROM_LEFT:
+      debugEvent(F("제자리로..."));
+      break;
+
+    case ST_TURN_RIGHT_SEARCH:
+      debugEvent(F("오른쪽 회전..."));
+      break;
+
+    case ST_CHECK_RIGHT:
+      debugEvent(F("오른쪽 거리 확인"));
+      break;
+
+    case ST_ESCAPE_FORWARD:
+      debugEvent(F("길 발견! 전진"));
+      break;
+
+    case ST_CRUISE:
+      debugEvent(F("일반 주행"));
+      break;
+
+    default:
+      break;
+  }
 #endif
 }
 
@@ -404,8 +406,12 @@ void runAutonomous() {
       handleTurnLeftSearch();
       break;
 
-    case ST_LEFT_MARGIN:
-      handleLeftMargin();
+    case ST_CHECK_LEFT:
+      handleCheckLeft();
+      break;
+
+    case ST_RETURN_CENTER_FROM_LEFT:
+      handleReturnCenterFromLeft();
       break;
 
     case ST_ESCAPE_FORWARD:
@@ -416,20 +422,8 @@ void runAutonomous() {
       handleTurnRightSearch();
       break;
 
-    case ST_RIGHT_MARGIN:
-      handleRightMargin();
-      break;
-
-    case ST_FAIL_BACK:
-      handleFailBack();
-      break;
-
-    case ST_FAIL_TURN:
-      handleFailTurn();
-      break;
-
-    case ST_RECOVERY_FORWARD:
-      handleRecoveryForward();
+    case ST_CHECK_RIGHT:
+      handleCheckRight();
       break;
 
     default:
@@ -446,16 +440,6 @@ void runAutonomous() {
 void handleCruise() {
   int d = filteredDistance;
 
-  /*
-    긴급 거리 이하에서는 짧은 회피 루틴으로 가지 않고
-    바로 긴급 탈출 루틴으로 보낸다.
-  */
-  if (d <= DANGER_DISTANCE) {
-    stopMotor();
-    enterState(ST_FAIL_BACK);
-    return;
-  }
-
   if (d <= DANGER_DISTANCE) {
     dangerCount++;
   } else {
@@ -468,13 +452,7 @@ void handleCruise() {
     return;
   }
 
-  if (d <= SLOW_DISTANCE) {
-    setMotor(LOW_SPEED, LOW_SPEED);
-  } else if (d <= CLEAR_DISTANCE) {
-    setMotor(MID_SPEED, MID_SPEED);
-  } else {
-    setMotor(HIGH_SPEED, HIGH_SPEED);
-  }
+  setMotor(DRIVE_SPEED, DRIVE_SPEED);
 }
 
 void handleStopBeforeBack() {
@@ -504,47 +482,50 @@ void handleStopBeforeLeft() {
 
 void handleTurnLeftSearch() {
   /*
-    제자리 좌회전:
-    왼쪽 바퀴 후진, 오른쪽 바퀴 전진
+    왼쪽 탐색:
+    왼쪽 바퀴는 멈추고 오른쪽 바퀴만 전진시켜 좌회전한다.
   */
-  setMotor(-TURN_SPEED, TURN_SPEED);
+  setMotor(0, TURN_SPEED);
 
   unsigned long elapsed = millis() - stateStartMs;
 
-  /*
-    최소 회전 시간 전까지는 거리값이 열려 보여도 무시한다.
-  */
-  if (elapsed < TURN_MIN_MS) {
+  if (elapsed < PIVOT_TURN_MS) {
+    return;
+  }
+
+  stopMotor();
+  enterState(ST_CHECK_LEFT);
+}
+
+void handleCheckLeft() {
+  stopMotor();
+
+  if (millis() - stateStartMs < STOP_SETTLE_MS) {
     return;
   }
 
   if (filteredDistance >= CLEAR_DISTANCE) {
-    clearCount++;
-  } else {
-    clearCount = 0;
-  }
-
-  if (clearCount >= CLEAR_CONFIRM_COUNT) {
+    clearCount = 1;
     escapeDirection = -1;
-    enterState(ST_LEFT_MARGIN);
+    debugEvent(F("왼쪽 길 발견"));
+    enterState(ST_ESCAPE_FORWARD);
     return;
   }
 
-  if (elapsed >= TURN_LEFT_MAX_MS) {
-    enterState(ST_TURN_RIGHT_SEARCH);
-    return;
-  }
+  clearCount = 0;
+  debugEvent(F("왼쪽 길이 없네요..."));
+  enterState(ST_RETURN_CENTER_FROM_LEFT);
 }
 
-void handleLeftMargin() {
+void handleReturnCenterFromLeft() {
   /*
-    열린 공간을 찾은 뒤 조금 더 좌회전.
+    왼쪽 탐색 실패 후 오른쪽 바퀴만 후진시켜 원래 방향으로 돌아온다.
   */
-  setMotor(-TURN_SPEED, TURN_SPEED);
+  setMotor(0, -TURN_SPEED);
 
-  if (millis() - stateStartMs >= TURN_MARGIN_MS) {
+  if (millis() - stateStartMs >= PIVOT_TURN_MS) {
     stopMotor();
-    enterState(ST_ESCAPE_FORWARD);
+    enterState(ST_TURN_RIGHT_SEARCH);
   }
 }
 
@@ -554,11 +535,11 @@ void handleEscapeForward() {
   */
   if (filteredDistance <= DANGER_DISTANCE) {
     stopMotor();
-    enterState(ST_FAIL_BACK);
+    enterState(ST_STOP_BEFORE_BACK);
     return;
   }
 
-  setMotor(MID_SPEED, MID_SPEED);
+  setMotor(DRIVE_SPEED, DRIVE_SPEED);
 
   if (millis() - stateStartMs >= ESCAPE_FORWARD_MS) {
     enterState(ST_CRUISE);
@@ -568,85 +549,38 @@ void handleEscapeForward() {
 void handleTurnRightSearch() {
   /*
     오른쪽 탐색:
-    왼쪽 탐색 실패 후 반대 방향으로 크게 돌아 열린 공간을 찾는다.
+    오른쪽 바퀴는 멈추고 왼쪽 바퀴만 전진시켜 우회전한다.
   */
-  setMotor(TURN_SPEED, -TURN_SPEED);
+  setMotor(TURN_SPEED, 0);
 
   unsigned long elapsed = millis() - stateStartMs;
 
-  if (elapsed < TURN_RIGHT_MIN_MS) {
+  if (elapsed < PIVOT_TURN_MS) {
+    return;
+  }
+
+  stopMotor();
+  enterState(ST_CHECK_RIGHT);
+}
+
+void handleCheckRight() {
+  stopMotor();
+
+  if (millis() - stateStartMs < STOP_SETTLE_MS) {
     return;
   }
 
   if (filteredDistance >= CLEAR_DISTANCE) {
-    clearCount++;
-  } else {
-    clearCount = 0;
-  }
-
-  if (clearCount >= CLEAR_CONFIRM_COUNT) {
+    clearCount = 1;
     escapeDirection = 1;
-    enterState(ST_RIGHT_MARGIN);
-    return;
-  }
-
-  if (elapsed >= TURN_RIGHT_MAX_MS) {
-    enterState(ST_FAIL_BACK);
-    return;
-  }
-}
-
-void handleRightMargin() {
-  /*
-    열린 공간을 찾은 뒤 조금 더 우회전.
-  */
-  setMotor(TURN_SPEED, -TURN_SPEED);
-
-  if (millis() - stateStartMs >= TURN_MARGIN_MS) {
-    stopMotor();
+    debugEvent(F("오른쪽 길 발견"));
     enterState(ST_ESCAPE_FORWARD);
-  }
-}
-
-void handleFailBack() {
-  /*
-    긴급 탈출 후진.
-  */
-  setMotor(-BACK_SPEED, -BACK_SPEED);
-
-  if (millis() - stateStartMs >= FAIL_BACK_MS) {
-    stopMotor();
-    enterState(ST_FAIL_TURN);
-  }
-}
-
-void handleFailTurn() {
-  /*
-    긴급 탈출용 큰 우회전.
-  */
-  setMotor(TURN_SPEED, -TURN_SPEED);
-
-  if (millis() - stateStartMs >= FAIL_TURN_MS) {
-    stopMotor();
-    enterState(ST_RECOVERY_FORWARD);
-  }
-}
-
-void handleRecoveryForward() {
-  /*
-    긴급 탈출 후 저속 전진.
-  */
-  if (filteredDistance <= DANGER_DISTANCE) {
-    stopMotor();
-    enterState(ST_FAIL_BACK);
     return;
   }
 
-  setMotor(LOW_SPEED, LOW_SPEED);
-
-  if (millis() - stateStartMs >= RECOVERY_FORWARD_MS) {
-    enterState(ST_CRUISE);
-  }
+  clearCount = 0;
+  debugEvent(F("오른쪽도 길이 없네요..."));
+  enterState(ST_STOP_BEFORE_BACK);
 }
 
 // =======================================================
@@ -716,6 +650,54 @@ void stopMotor() {
 // 17. 디버그 출력
 // =======================================================
 
+const __FlashStringHelper *stateName(AutoState currentState) {
+  switch (currentState) {
+    case ST_CRUISE:
+      return F("일반 주행");
+
+    case ST_STOP_BEFORE_BACK:
+      return F("후진 전 정지");
+
+    case ST_BACK:
+      return F("후진");
+
+    case ST_STOP_BEFORE_LEFT:
+      return F("왼쪽 회전 전 정지");
+
+    case ST_TURN_LEFT_SEARCH:
+      return F("왼쪽 회전");
+
+    case ST_CHECK_LEFT:
+      return F("왼쪽 거리 확인");
+
+    case ST_RETURN_CENTER_FROM_LEFT:
+      return F("제자리 복귀");
+
+    case ST_ESCAPE_FORWARD:
+      return F("회피 전진");
+
+    case ST_TURN_RIGHT_SEARCH:
+      return F("오른쪽 회전");
+
+    case ST_CHECK_RIGHT:
+      return F("오른쪽 거리 확인");
+
+    default:
+      return F("알 수 없음");
+  }
+}
+
+void debugEvent(const __FlashStringHelper *message) {
+#if DEBUG_SERIAL
+  Serial.print(F("이벤트: "));
+  Serial.print(message);
+  Serial.print(F(" 거리="));
+  Serial.println(filteredDistance);
+#else
+  (void)message;
+#endif
+}
+
 void debugPrint() {
 #if DEBUG_SERIAL
   static unsigned long lastDebugMs = 0;
@@ -726,16 +708,16 @@ void debugPrint() {
 
   lastDebugMs = millis();
 
-  Serial.print(F("state="));
+  Serial.print(F("상태="));
   Serial.print((int)state);
 
-  Serial.print(F(" dist="));
+  Serial.print(F(" 거리="));
   Serial.print(filteredDistance);
 
-  Serial.print(F(" clear="));
+  Serial.print(F(" 열린공간횟수="));
   Serial.print(clearCount);
 
-  Serial.print(F(" danger="));
+  Serial.print(F(" 위험횟수="));
   Serial.println(dangerCount);
 #endif
 }
