@@ -10,10 +10,10 @@
   Sonar  : HC-SR04, TRIG=A0, ECHO=A1
 
   주행 전략:
-  - 전방 초음파 1개만 사용
+  - 전방 초음파 센서 1개만 사용
   - 엔코더 없음
   - 범퍼 스위치 없음
-  - 정확한 각도 회전 대신, 열린 공간 탐색 기반 회피
+  - 정확한 각도 회전이 아니라, 열린 공간 탐색 기반 회피
 */
 
 // =======================================================
@@ -35,16 +35,16 @@ const uint8_t ECHO_PIN = A1;
 // 3. 모터 설정
 // =======================================================
 
-// 사용자 정보 기준:
+// 실제 사용 기준:
 // 왼쪽 전방 구동 모터 = M1
 // 오른쪽 전방 구동 모터 = M4
 AF_DCMotor motorLeft(1);
 AF_DCMotor motorRight(4);
 
 /*
-  모터 방향 보정값
+  모터 방향 보정
 
-  setMotor(150, 150)을 했는데:
+  setMotor(150, 150)을 실행했을 때:
   - 둘 다 전진하면 그대로 0
   - 왼쪽만 후진하면 LEFT_MOTOR_INVERT = 1
   - 오른쪽만 후진하면 RIGHT_MOTOR_INVERT = 1
@@ -55,26 +55,39 @@ const uint8_t RIGHT_MOTOR_INVERT = 0;
 /*
   좌우 모터 출력 보정
 
-  전진할 때 차가 오른쪽으로 휘면:
-  - 오른쪽 모터가 강하거나 왼쪽 모터가 약한 것
-  - RIGHT_TRIM을 음수로 하거나 LEFT_TRIM을 양수로 조정
+  현재 테스트 결과:
+  - 오른쪽 바퀴 힘이 약함
+  - 직진 시 왼쪽으로 편향됨
 
-  전진할 때 차가 왼쪽으로 휘면:
-  - LEFT_TRIM을 음수로 하거나 RIGHT_TRIM을 양수로 조정
+  따라서 오른쪽 모터에 +18 보정값을 적용한다.
 */
-const int LEFT_TRIM  = 0;
-const int RIGHT_TRIM = 0;
+const int LEFT_TRIM  = -10;
+const int RIGHT_TRIM = 35;
 
 // =======================================================
 // 4. 속도 튜닝값
 // =======================================================
 
-const int HIGH_SPEED = 170;
-const int MID_SPEED  = 140;
-const int LOW_SPEED  = 105;
+/*
+  이전 버전보다 전체 속도를 올림.
 
-const int TURN_SPEED = 140;
-const int BACK_SPEED = 125;
+  이유:
+  - 속도를 너무 낮추면 L293D + DC 모터 조합에서 기동 토크가 부족함
+  - 오른쪽 바퀴가 제대로 돌지 않음
+  - 직진 시 왼쪽으로 편향됨
+
+  단, 초기에 너무 빠르게 벽에 박는 문제가 있었으므로
+  원래 고속값까지는 올리지 않고 중간 수준으로 조정한다.
+*/
+const int HIGH_SPEED = 155;
+const int MID_SPEED  = 135;
+const int LOW_SPEED  = 115;
+
+/*
+  회전과 후진도 토크 부족을 막기 위해 이전보다 올림.
+*/
+const int TURN_SPEED = 130;
+const int BACK_SPEED = 115;
 
 // 모터 PWM 범위
 const int MOTOR_MIN = -255;
@@ -85,17 +98,13 @@ const int MOTOR_MAX = 255;
 // =======================================================
 
 /*
-  차체:
-  - 길이 약 22cm
-  - 너비 약 18cm
-
-  초음파는 차체 중앙 전방만 보기 때문에,
-  차체 폭 여유를 고려해 CLEAR_DISTANCE를 넉넉히 잡는다.
+  시험 도로가 매우 좁고 짧기 때문에 거리 기준값은 작게 유지한다.
+  이 값들은 현재 시험 환경에 맞춰 사용자가 직접 조정한 값이므로 변경하지 않는다.
 */
-const int EMERGENCY_DISTANCE = 13;  // 너무 가까움
-const int DANGER_DISTANCE    = 24;  // 회피 시작
-const int SLOW_DISTANCE      = 40;  // 감속 시작
-const int CLEAR_DISTANCE     = 55;  // 열린 공간 인정 기준
+const int EMERGENCY_DISTANCE = 2;   // 너무 가까움
+const int DANGER_DISTANCE    = 5;   // 회피 시작
+const int SLOW_DISTANCE      = 8;   // 감속 시작
+const int CLEAR_DISTANCE     = 12;  // 열린 공간 판단 기준
 
 const int MIN_VALID_DISTANCE = 2;
 const int MAX_VALID_DISTANCE = 200;
@@ -114,8 +123,7 @@ const unsigned long SONAR_INTERVAL_MS = 60;
 
 /*
   12000us는 약 200cm 정도까지 측정.
-  400cm까지 기다리면 코드가 너무 오래 막힐 수 있으므로
-  강의실 주행용으로는 200cm 내외 timeout이 더 적합.
+  강의실 주행에서는 200cm 내외 timeout이면 충분하다.
 */
 const unsigned long SONAR_TIMEOUT_US = 12000UL;
 
@@ -123,6 +131,7 @@ int distanceBuffer[3] = {80, 80, 80};
 uint8_t distanceIndex = 0;
 int filteredDistance = 80;
 int lastValidDistance = 80;
+bool sonarUpdated = false;
 
 unsigned long lastSonarMs = 0;
 
@@ -130,52 +139,38 @@ unsigned long lastSonarMs = 0;
 // 7. 상태 머신 시간값
 // =======================================================
 
-const unsigned long STOP_SETTLE_MS      = 100;
+const unsigned long STOP_SETTLE_MS = 100;
 
 /*
-  차체 길이가 22cm이고 전방 센서만 있으므로,
-  장애물 앞에서 바로 회전하지 말고 살짝 후진한다.
+  벽에 붙었을 때 짧게 후진해서 회전 공간을 만든다.
 */
-const unsigned long BACK_MS             = 380;
+const unsigned long BACK_MS = 500;
 
 /*
-  회전 시작 후 이 시간 전까지는 열린 공간이 보여도 무시.
-  너무 빨리 열린 공간으로 판단하면 코너 모서리에 걸릴 수 있다.
+  회전 시간이 너무 짧으면 실제로는 30도 정도만 회전할 수 있으므로
+  회전 관련 시간을 길게 잡는다.
 */
-const unsigned long TURN_MIN_MS         = 380;
+const unsigned long TURN_MIN_MS = 350;
+const unsigned long TURN_LEFT_MAX_MS = 950;
+const unsigned long TURN_RIGHT_MIN_MS = 500;
+const unsigned long TURN_RIGHT_MAX_MS = 1400;
 
 /*
-  왼쪽으로 이 시간 이상 돌았는데도 공간이 안 열리면
-  왼쪽은 실패로 보고 오른쪽 탐색으로 넘어간다.
+  열린 공간을 찾은 뒤 차체 폭 보정을 위해 추가 회전.
 */
-const unsigned long TURN_LEFT_MAX_MS    = 1100;
+const unsigned long TURN_MARGIN_MS = 150;
 
 /*
-  왼쪽 탐색 실패 후 오른쪽을 보려면
-  원래 정면을 지나 오른쪽까지 가야 하므로 더 길게 잡는다.
+  회피 성공 후 전진 보장 시간.
 */
-const unsigned long TURN_RIGHT_MIN_MS   = 650;
-const unsigned long TURN_RIGHT_MAX_MS   = 1800;
+const unsigned long ESCAPE_FORWARD_MS = 800;
 
 /*
-  차체 폭 18cm 보정용.
-  열린 공간을 찾은 뒤 바로 전진하지 말고
-  같은 방향으로 조금 더 회전한다.
+  긴급 탈출 루틴.
 */
-const unsigned long TURN_MARGIN_MS      = 180;
-
-/*
-  회피 후 찔끔찔끔 재회피를 방지하기 위한 전진 보장 시간.
-  단, EMERGENCY_DISTANCE 이하면 즉시 다시 회피.
-*/
-const unsigned long ESCAPE_FORWARD_MS   = 650;
-
-/*
-  양쪽 실패 시 탈출용.
-*/
-const unsigned long FAIL_BACK_MS        = 600;
-const unsigned long FAIL_TURN_MS        = 1000;
-const unsigned long RECOVERY_FORWARD_MS = 450;
+const unsigned long FAIL_BACK_MS        = 850;
+const unsigned long FAIL_TURN_MS        = 2600;
+const unsigned long RECOVERY_FORWARD_MS = 600;
 
 // =======================================================
 // 8. 상태 정의
@@ -320,8 +315,8 @@ void updateSonarIfNeeded() {
     );
   } else {
     /*
-      timeout 또는 비정상값이면 바로 0으로 처리하지 않는다.
-      마지막 정상값을 유지해서 오동작을 줄인다.
+      timeout 또는 비정상값이면 바로 0으로 처리하지 않고
+      마지막 정상값을 사용해서 순간 튐을 줄인다.
     */
     pushDistance(lastValidDistance);
     filteredDistance = median3(
@@ -451,9 +446,13 @@ void runAutonomous() {
 void handleCruise() {
   int d = filteredDistance;
 
-  if (d <= EMERGENCY_DISTANCE) {
+  /*
+    긴급 거리 이하에서는 짧은 회피 루틴으로 가지 않고
+    바로 긴급 탈출 루틴으로 보낸다.
+  */
+  if (d <= DANGER_DISTANCE) {
     stopMotor();
-    enterState(ST_STOP_BEFORE_BACK);
+    enterState(ST_FAIL_BACK);
     return;
   }
 
@@ -513,11 +512,7 @@ void handleTurnLeftSearch() {
   unsigned long elapsed = millis() - stateStartMs;
 
   /*
-    최소 회전 시간 전까지는 거리값을 믿지 않는다.
-    이유:
-    - 회전 초기에 초음파가 장애물 모서리 틈을 보고
-      열린 공간으로 착각할 수 있음
-    - 차체 폭 18cm 때문에 바퀴가 아직 장애물에 걸릴 수 있음
+    최소 회전 시간 전까지는 거리값이 열려 보여도 무시한다.
   */
   if (elapsed < TURN_MIN_MS) {
     return;
@@ -536,11 +531,6 @@ void handleTurnLeftSearch() {
   }
 
   if (elapsed >= TURN_LEFT_MAX_MS) {
-    /*
-      왼쪽이 계속 막혀 있으면 오른쪽 탐색.
-      현재 왼쪽으로 돌아간 상태이므로,
-      오른쪽 탐색은 더 오래 필요하다.
-    */
     enterState(ST_TURN_RIGHT_SEARCH);
     return;
   }
@@ -548,8 +538,7 @@ void handleTurnLeftSearch() {
 
 void handleLeftMargin() {
   /*
-    열린 공간을 찾은 뒤에도 조금 더 좌회전.
-    차체 폭 18cm 보정용.
+    열린 공간을 찾은 뒤 조금 더 좌회전.
   */
   setMotor(-TURN_SPEED, TURN_SPEED);
 
@@ -561,14 +550,11 @@ void handleLeftMargin() {
 
 void handleEscapeForward() {
   /*
-    회피 성공 후에는 바로 다시 회피하지 않고
-    일정 시간 전진을 보장한다.
-
-    단, 너무 가까우면 즉시 회피.
+    회피 성공 후 일정 시간 전진을 보장한다.
   */
-  if (filteredDistance <= EMERGENCY_DISTANCE) {
+  if (filteredDistance <= DANGER_DISTANCE) {
     stopMotor();
-    enterState(ST_STOP_BEFORE_BACK);
+    enterState(ST_FAIL_BACK);
     return;
   }
 
@@ -582,12 +568,7 @@ void handleEscapeForward() {
 void handleTurnRightSearch() {
   /*
     오른쪽 탐색:
-    왼쪽 탐색 실패 후 시작하므로,
-    현재 차체는 왼쪽으로 어느 정도 돌아간 상태다.
-
-    오른쪽을 보려면
-    왼쪽 방향 → 원래 정면 → 오른쪽 방향
-    으로 더 오래 돌아야 한다.
+    왼쪽 탐색 실패 후 반대 방향으로 크게 돌아 열린 공간을 찾는다.
   */
   setMotor(TURN_SPEED, -TURN_SPEED);
 
@@ -617,8 +598,7 @@ void handleTurnRightSearch() {
 
 void handleRightMargin() {
   /*
-    열린 공간을 찾은 뒤에도 조금 더 우회전.
-    차체 폭 18cm 보정용.
+    열린 공간을 찾은 뒤 조금 더 우회전.
   */
   setMotor(TURN_SPEED, -TURN_SPEED);
 
@@ -630,8 +610,7 @@ void handleRightMargin() {
 
 void handleFailBack() {
   /*
-    양쪽 탐색이 모두 실패한 경우:
-    더 길게 후진해서 공간을 확보한다.
+    긴급 탈출 후진.
   */
   setMotor(-BACK_SPEED, -BACK_SPEED);
 
@@ -643,8 +622,7 @@ void handleFailBack() {
 
 void handleFailTurn() {
   /*
-    막다른 형태에서 빠져나오기 위한 큰 회전.
-    기본은 오른쪽 큰 회전.
+    긴급 탈출용 큰 우회전.
   */
   setMotor(TURN_SPEED, -TURN_SPEED);
 
@@ -656,12 +634,11 @@ void handleFailTurn() {
 
 void handleRecoveryForward() {
   /*
-    탈출 후 바로 고속 주행하지 않고
-    잠깐 중속 전진해서 안정화.
+    긴급 탈출 후 저속 전진.
   */
-  if (filteredDistance <= EMERGENCY_DISTANCE) {
+  if (filteredDistance <= DANGER_DISTANCE) {
     stopMotor();
-    enterState(ST_STOP_BEFORE_BACK);
+    enterState(ST_FAIL_BACK);
     return;
   }
 
