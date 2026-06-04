@@ -1,58 +1,55 @@
 #include <Arduino.h>
 #include <AFMotor.h>
 #include <SoftwareSerial.h>
+
 /*
-  2WD Autonomous RC Car  v3
+  2WD Autonomous RC Car  v4
   Board  : Arduino Uno SMD R3
   Shield : HW-130 V0.0.4 / L293D Motor Shield V1
   Left   : M1  /  Right : M4
   Sonar  : HC-SR04, TRIG=A0, ECHO=A1
 
-  주행 전략 (v3):
-  ┌─────────────────────────────────────────────────────┐
-  │ 1. 교번 피벗 턴                                      │
-  │    홀수 스텝 → 오른쪽 바퀴 전진                       │
-  │    짝수 스텝 → 왼쪽 바퀴 후진                         │
-  │    → 회전 중심이 차체 중앙에 가까워져 회전 반경 최소화  │
-  │                                                     │
-  │ 2. 좁은 스윕 + 후진 반복                             │
-  │    한 라운드 = 한쪽 방향 MAX_SWEEP_STEPS(4) 스텝       │
-  │    왼쪽 실패 → 오른쪽 / 오른쪽 실패 → 후진 후 재시도   │
-  │    매 라운드마다 시작 방향 교체 (편향 방지)             │
-  │                                                     │
-  │ 3. 피크 탐색                                         │
-  │    처음 CLEAR_DISTANCE 도달 → 즉시 직진 안 함          │
-  │    거리가 정체/하강으로 바뀌는 피크 지점을 찾아서 직진   │
-  │    → 코너 대각선에서 조기 직진하는 문제 방지            │
-  │    피크 탐색도 PEAK_MAX_STEPS로 횟수 제한              │
-  └─────────────────────────────────────────────────────┘
+  주행 정책:
+  1. 직진하다 벽 감지 → 정지
+  2. 오른쪽 90도 회전 → 확인
+       길이다 → 직진
+       아니다 → 정면 복귀 (왼쪽 90도)
+  3. 정면 확인
+       길이다 → 직진 (이론상 없는 케이스)
+       아니다 → 왼쪽 90도 회전 → 확인
+  4. 왼쪽 확인
+       길이다 → 직진
+       아니다 → 유턴 (왼쪽 90도 한번 더) → 직진 (왔던 길)
+
+  회전 방식: 교번 피벗 (한쪽 전진 + 반대쪽 후진 반복)
+  후진 정책: 없음
+  스윕 정책: 없음
 */
+
 // =======================================================
-// 1. 디버그 설정
+// 1. 디버그
 // =======================================================
 
 #define DEBUG_SERIAL 1
 
-const unsigned long DEBUG_PRINT_INTERVAL_MS = 300;
-
 // =======================================================
-// 2. 핀 설정
+// 2. 핀
 // =======================================================
 
 const uint8_t TRIG_PIN = A0;
 const uint8_t ECHO_PIN = A1;
 
 // =======================================================
-// 2-1. Bluetooth 로그 설정
+// 3. 블루투스
 // =======================================================
 
-const uint8_t BT_RX_PIN = A4;  // Arduino RX <- HC-06 TXD
-const uint8_t BT_TX_PIN = A5;  // Arduino TX -> HC-06 RXD
+const uint8_t BT_RX_PIN = A4;
+const uint8_t BT_TX_PIN = A5;
 
 SoftwareSerial BT(BT_RX_PIN, BT_TX_PIN);
 
 // =======================================================
-// 3. 모터 설정
+// 4. 모터
 // =======================================================
 
 AF_DCMotor motorLeft(1);
@@ -64,107 +61,100 @@ const uint8_t RIGHT_MOTOR_INVERT = 0;
 const int LEFT_TRIM  = -10;
 const int RIGHT_TRIM = 35;
 
-// =======================================================
-// 4. 속도
-// =======================================================
-
-const int DRIVE_SPEED = 155;
-const int TURN_SPEED  = 155;
-const int BACK_SPEED  = 130;
-
 const int MOTOR_MIN = -255;
 const int MOTOR_MAX = 255;
 
 // =======================================================
-// 5. 거리 기준값
+// 5. 속도
 // =======================================================
 
-const int DANGER_DISTANCE      = 13;
-const int CLEAR_DISTANCE       = 20;
-const int MIN_VALID_DISTANCE   = 2;
-const int MAX_VALID_DISTANCE   = 100;
+const int DRIVE_SPEED = 155;
+const int BACK_SPEED  = 130;
+
+/*
+  피벗 속도: 트림 없이 직접 모터 제어하므로
+  정지 마찰을 이길 수 있도록 충분히 높게 설정
+*/
+const int PIVOT_SPEED = 220;
+
+// =======================================================
+// 6. 거리 기준값
+// =======================================================
+
+const int DANGER_DISTANCE     = 12;
+const int CLEAR_DISTANCE      = 22;
+const int MIN_VALID_DISTANCE  = 2;
+const int MAX_VALID_DISTANCE  = 200;
 const int DANGER_CONFIRM_COUNT = 1;
 
 // =======================================================
-// 6. 초음파
+// 7. 초음파
 // =======================================================
 
 const unsigned long SONAR_INTERVAL_MS = 60;
 const unsigned long SONAR_TIMEOUT_US  = 12000UL;
 
 int distanceBuffer[3] = {80, 80, 80};
-uint8_t distanceIndex = 0;
-int filteredDistance  = 80;
-int lastValidDistance = 80;
+uint8_t distanceIndex  = 0;
+int filteredDistance   = 80;
+int lastValidDistance  = 80;
 
 unsigned long lastSonarMs = 0;
 
 // =======================================================
-// 7. 타이밍
+// 8. 타이밍
 // =======================================================
 
-const unsigned long STOP_SETTLE_MS    = 200;
-const unsigned long BACK_MS           = 400;
-const unsigned long ESCAPE_FORWARD_MS = 500;
+const unsigned long STOP_SETTLE_MS   = 200;
+const unsigned long ESCAPE_FWD_MS    = 600;
 
-const unsigned long SWEEP_STEP_MS    = 200;
-const unsigned long SWEEP_SETTLE_MS  = 300;
-const int           MAX_SWEEP_STEPS  = 5;
-const int           PEAK_MAX_STEPS   = 3;
+/*
+  PIVOT_90_MS: 교번 피벗으로 90도 회전하는 데 걸리는 시간.
+  실제 하드웨어에서 측정해서 이 값만 조정한다.
+  - 너무 짧으면 90도 미만 회전
+  - 너무 길면 90도 초과 회전
+  기본값 700ms는 시작점, 실측 후 수정할 것.
+*/
+const unsigned long PIVOT_90_MS      = 350;
+const unsigned long PIVOT_180_MS     = 700;  // 90도 * 2
+const unsigned long CHECK_SETTLE_MS  = 350;  // 150 → 350
 
 // =======================================================
-// 8. 상태 정의
+// 9. 상태 정의
 // =======================================================
 
+/*
+  ST_CRUISE       : 직진
+  ST_STOP         : 정지 + 관성 제거
+  ST_TURN_RIGHT   : 오른쪽 90도 회전
+  ST_CHECK_RIGHT  : 오른쪽 방향 거리 확인
+  ST_TURN_CENTER  : 정면 복귀 (왼쪽 90도)
+  ST_CHECK_CENTER : 정면 거리 확인
+  ST_TURN_LEFT    : 왼쪽 90도 회전
+  ST_CHECK_LEFT   : 왼쪽 방향 거리 확인
+  ST_UTURN        : 유턴 (왼쪽 90도 한번 더)
+  ST_ESCAPE_FWD   : 탈출 전진
+*/
 enum AutoState {
   ST_CRUISE = 0,
-  ST_STOP_BEFORE_BACK,
-  ST_BACK,
-  ST_SWEEP,
-  ST_SWEEP_SETTLE,
-  ST_ESCAPE_FORWARD
+  ST_STOP,
+  ST_TURN_RIGHT,
+  ST_CHECK_RIGHT,
+  ST_TURN_LEFT_180,   // 정면 복귀 + 왼쪽 탐색을 한번에
+  ST_CHECK_LEFT,
+  ST_UTURN,
+  ST_ESCAPE_FWD
 };
 
-AutoState state = ST_CRUISE;
+AutoState state        = ST_CRUISE;
 unsigned long stateStartMs = 0;
-int dangerCount = 0;
-
-// =======================================================
-// 9. 스윕 전용 변수
-// =======================================================
-
-int sweepDir       = -1;
-int sweepStepCount = 0;
-int sweepRound     = 0;
-
-bool peakMode      = false;
-int peakStepCount  = 0;
-int prevDistance   = 0;
-int bestDistance   = 0;
-
-bool triedBothDirections = false;
-// 탈출 성공 방향 기억 (-1=왼쪽으로 탈출, +1=오른쪽으로 탈출)
-int escapeDir = -1;
-
-// 직진 타임아웃
-const unsigned long CRUISE_TIMEOUT_MS = 10000UL;
-
-// 끼임 감지: 이 시간 동안 거리 변화가 STUCK_DELTA 이하면 끼임
-const unsigned long STUCK_CHECK_MS = 5000UL;
-const int           STUCK_DELTA    = 3;
-
-unsigned long cruiseStartMs   = 0;
-int           cruiseStartDist = 0;
-unsigned long stuckCheckMs    = 0;
-int           stuckCheckDist  = 0;
+int dangerCount        = 0;
 
 // =======================================================
 // 10. 함수 선언
 // =======================================================
 
-void enterState(AutoState nextState);
-void beginSweep();
-void beginNextHalf();
+void enterState(AutoState s);
 
 void updateSonarIfNeeded();
 int  readSonarCm();
@@ -174,21 +164,23 @@ int  median3(int a, int b, int c);
 
 void runAutonomous();
 void handleCruise();
-void handleStopBeforeBack();
-void handleBack();
-void handleSweep();
-void handleSweepSettle();
-void handleEscapeForward();
+void handleStop();
+void handleTurnRight();
+void handleCheckRight();
+void handleTurnLeft180();
+void handleCheckLeft();
+void handleUturn();
+void handleEscapeFwd();
 
-void pivotStep(int direction, int stepIndex);
+void pivotRight();
+void pivotLeft();
 void setMotor(int left, int right);
 void setOneMotor(AF_DCMotor &motor, int signedSpeed, uint8_t invert);
 int  applyTrim(int speed, int trim);
 void stopMotor();
 
 const __FlashStringHelper *stateName(AutoState s);
-void debugEvent(const __FlashStringHelper *msg);
-void debugPrint();
+void logln(const __FlashStringHelper *msg);
 
 // =======================================================
 // 11. setup
@@ -204,14 +196,7 @@ void setup() {
 
   stopMotor();
 
-#if DEBUG_SERIAL
-  Serial.println(F("RC autonomous v3"));
-  Serial.println(F("교번 피벗 + 대칭 스윕 + 피크 탐색"));
-  Serial.println(F("BT log: HC-06 RX=A2 TX=A3"));
-
-  BT.println(F("RC autonomous v3"));
-  BT.println(F("BT log ready"));
-#endif
+  logln(F("RC autonomous v4 - open loop 90deg"));
 
   stateStartMs = millis();
 }
@@ -223,105 +208,37 @@ void setup() {
 void loop() {
   updateSonarIfNeeded();
   runAutonomous();
-  debugPrint();
 }
 
 // =======================================================
 // 13. 상태 진입
 // =======================================================
 
-void enterState(AutoState nextState) {
-  state        = nextState;
+void enterState(AutoState s) {
+  state        = s;
   stateStartMs = millis();
   dangerCount  = 0;
 
 #if DEBUG_SERIAL
   Serial.print(F("["));
-  Serial.print(stateName(state));
+  Serial.print(stateName(s));
   Serial.print(F("] D="));
-  Serial.print(filteredDistance);
-  Serial.print(F(" DIR="));
-  Serial.print(sweepDir == -1 ? F("L") : F("R"));
-  Serial.print(F(" STP="));
-  Serial.print(sweepStepCount);
-  Serial.print(F(" RND="));
-  Serial.println(sweepRound);
+  Serial.println(filteredDistance);
 
-  BT.print(F("상태 -> "));
-  BT.println(stateName(state));
+  BT.print(F("["));
+  BT.print(stateName(s));
+  BT.print(F("] D="));
+  BT.println(filteredDistance);
 #endif
 }
 
 // =======================================================
-// 14. 스윕 시작
-// =======================================================
-
-void beginSweep() {
-  // 탈출 전진 중 충돌했다면 escapeDir의 반대 방향부터 탐색
-  // 탈출 방향 = 왔던 방향이므로 반대쪽이 새 길일 확률이 높음
-  if (sweepRound > 0) {
-    sweepDir = -escapeDir;
-  } else {
-    sweepDir = (sweepRound % 2 == 0) ? -1 : 1;
-  }
-
-  sweepStepCount = 0;
-  sweepRound++;
-
-  peakMode      = false;
-  peakStepCount = 0;
-  prevDistance  = filteredDistance;
-  bestDistance  = filteredDistance;
-
-  enterState(ST_SWEEP);
-
-#if DEBUG_SERIAL
-  Serial.print(F("스윕 라운드="));
-  Serial.print(sweepRound);
-  Serial.print(F(" 방향="));
-  Serial.println(sweepDir == -1 ? F("왼쪽") : F("오른쪽"));
-  BT.print(F("스윕 라운드="));
-  BT.print(sweepRound);
-  BT.print(F(" 방향="));
-  BT.println(sweepDir == -1 ? F("왼쪽") : F("오른쪽"));
-#endif
-}
-
-// =======================================================
-// 15. 현재 방향 실패 후 반대쪽 전환
-// =======================================================
-
-void beginNextHalf() {
-  sweepDir       = -sweepDir;
-  sweepStepCount = 0;
-
-  peakMode      = false;
-  peakStepCount = 0;
-  prevDistance  = filteredDistance;
-  bestDistance  = filteredDistance;
-
-  enterState(ST_SWEEP);
-
-#if DEBUG_SERIAL
-  Serial.print(F("반대 방향 전환 -> "));
-  Serial.println(sweepDir == -1 ? F("왼쪽") : F("오른쪽"));
-
-  BT.print(F("반대 방향 전환 -> "));
-  BT.println(sweepDir == -1 ? F("왼쪽") : F("오른쪽"));
-#endif
-}
-
-// =======================================================
-// 16. 초음파
+// 14. 초음파
 // =======================================================
 
 void updateSonarIfNeeded() {
   unsigned long now = millis();
-
-  if (now - lastSonarMs < SONAR_INTERVAL_MS) {
-    return;
-  }
-
+  if (now - lastSonarMs < SONAR_INTERVAL_MS) return;
   lastSonarMs = now;
 
   int raw = readSonarCm();
@@ -343,17 +260,12 @@ void updateSonarIfNeeded() {
 int readSonarCm() {
   digitalWrite(TRIG_PIN, LOW);
   delayMicroseconds(2);
-
   digitalWrite(TRIG_PIN, HIGH);
   delayMicroseconds(10);
   digitalWrite(TRIG_PIN, LOW);
 
   unsigned long duration = pulseIn(ECHO_PIN, HIGH, SONAR_TIMEOUT_US);
-
-  if (duration == 0) {
-    return -1;
-  }
-
+  if (duration == 0) return -1;
   return (int)(duration / 58UL);
 }
 
@@ -363,74 +275,40 @@ bool isValidDistance(int cm) {
 
 void pushDistance(int cm) {
   distanceBuffer[distanceIndex] = cm;
-
-  if (++distanceIndex >= 3) {
-    distanceIndex = 0;
-  }
+  if (++distanceIndex >= 3) distanceIndex = 0;
 }
 
 int median3(int a, int b, int c) {
-  if ((a <= b && b <= c) || (c <= b && b <= a)) {
-    return b;
-  }
-
-  if ((b <= a && a <= c) || (c <= a && a <= b)) {
-    return a;
-  }
-
+  if ((a <= b && b <= c) || (c <= b && b <= a)) return b;
+  if ((b <= a && a <= c) || (c <= a && a <= b)) return a;
   return c;
 }
 
 // =======================================================
-// 17. 자율주행 상태 머신
+// 15. 상태 머신
 // =======================================================
 
 void runAutonomous() {
   switch (state) {
-    case ST_CRUISE:
-      handleCruise();
-      break;
-
-    case ST_STOP_BEFORE_BACK:
-      handleStopBeforeBack();
-      break;
-
-    case ST_BACK:
-      handleBack();
-      break;
-
-    case ST_SWEEP:
-      handleSweep();
-      break;
-
-    case ST_SWEEP_SETTLE:
-      handleSweepSettle();
-      break;
-
-    case ST_ESCAPE_FORWARD:
-      handleEscapeForward();
-      break;
-
+    case ST_CRUISE:        handleCruise();      break;
+    case ST_STOP:          handleStop();        break;
+    case ST_TURN_RIGHT:    handleTurnRight();   break;
+    case ST_CHECK_RIGHT:   handleCheckRight();  break;
+    case ST_TURN_LEFT_180: handleTurnLeft180(); break;
+    case ST_CHECK_LEFT:    handleCheckLeft();   break;
+    case ST_UTURN:         handleUturn();       break;
+    case ST_ESCAPE_FWD:    handleEscapeFwd();   break;
     default:
       stopMotor();
       enterState(ST_CRUISE);
       break;
   }
 }
-
 // =======================================================
-// 18. 상태 처리
+// 16. 상태 처리
 // =======================================================
 
 void handleCruise() {
-  // 처음 CRUISE 진입 시 기준값 초기화
-  if (dangerCount == 0 && cruiseStartMs == 0) {
-    cruiseStartMs   = millis();
-    cruiseStartDist = filteredDistance;
-    stuckCheckMs    = millis();
-    stuckCheckDist  = filteredDistance;
-  }
-
   if (filteredDistance <= DANGER_DISTANCE) {
     dangerCount++;
   } else {
@@ -438,198 +316,143 @@ void handleCruise() {
   }
 
   if (dangerCount >= DANGER_CONFIRM_COUNT) {
-    cruiseStartMs = 0;
     stopMotor();
-    enterState(ST_STOP_BEFORE_BACK);
+    enterState(ST_STOP);
     return;
-  }
-
-  // 10초 직진 타임아웃
-  if (millis() - cruiseStartMs >= CRUISE_TIMEOUT_MS) {
-    cruiseStartMs = 0;
-    debugEvent(F("직진 타임아웃 → 후진"));
-    stopMotor();
-    enterState(ST_STOP_BEFORE_BACK);
-    return;
-  }
-
-  // 끼임 감지: 5초마다 거리 변화 확인
-  if (millis() - stuckCheckMs >= STUCK_CHECK_MS) {
-    int delta = abs(filteredDistance - stuckCheckDist);
-    stuckCheckMs   = millis();
-    stuckCheckDist = filteredDistance;
-
-    if (delta <= STUCK_DELTA) {
-      cruiseStartMs = 0;
-      debugEvent(F("끼임 감지 → 후진"));
-      stopMotor();
-      enterState(ST_STOP_BEFORE_BACK);
-      return;
-    }
   }
 
   setMotor(DRIVE_SPEED, DRIVE_SPEED);
 }
 
-void handleStopBeforeBack() {
+void handleStop() {
   stopMotor();
-
   if (millis() - stateStartMs >= STOP_SETTLE_MS) {
-    enterState(ST_BACK);
+    enterState(ST_TURN_RIGHT);
   }
 }
 
-void handleBack() {
-  setMotor(-BACK_SPEED, -BACK_SPEED);
-
-  if (millis() - stateStartMs >= BACK_MS) {
+/*
+  오른쪽 90도 회전.
+  pivotRight()를 PIVOT_90_MS 동안 실행.
+*/
+void handleTurnRight() {
+  pivotRight();
+  if (millis() - stateStartMs >= PIVOT_90_MS) {
     stopMotor();
-    beginSweep();
+    enterState(ST_CHECK_RIGHT);
   }
 }
 
-void handleSweep() {
-  pivotStep(sweepDir, sweepStepCount);
-
-  if (millis() - stateStartMs >= SWEEP_STEP_MS) {
-    stopMotor();
-    enterState(ST_SWEEP_SETTLE);
-  }
-}
-
-void pivotStep(int direction, int stepIndex) {
-  bool useForward = (stepIndex % 2 == 0);
-
-  // 피벗은 트림 없이 직접 모터 제어
-  const int PV = 240;
-
-  if (direction == -1) {
-    // 왼쪽 회전
-    if (useForward) {
-      setOneMotor(motorRight,  PV, RIGHT_MOTOR_INVERT);  // 오른쪽 전진
-      setOneMotor(motorLeft,    0, LEFT_MOTOR_INVERT);
-    } else {
-      setOneMotor(motorLeft,  -PV, LEFT_MOTOR_INVERT);   // 왼쪽 후진
-      setOneMotor(motorRight,   0, RIGHT_MOTOR_INVERT);
-    }
+void handleCheckRight() {
+  stopMotor();
+  if (millis() - stateStartMs < CHECK_SETTLE_MS) return;
+  if (filteredDistance >= CLEAR_DISTANCE) {
+    logln(F("오른쪽 길 발견 → 직진"));
+    enterState(ST_ESCAPE_FWD);
   } else {
-    // 오른쪽 회전
-    if (useForward) {
-      setOneMotor(motorLeft,   PV, LEFT_MOTOR_INVERT);   // 왼쪽 전진
-      setOneMotor(motorRight,   0, RIGHT_MOTOR_INVERT);
-    } else {
-      setOneMotor(motorRight, -PV, RIGHT_MOTOR_INVERT);  // 오른쪽 후진
-      setOneMotor(motorLeft,    0, LEFT_MOTOR_INVERT);
-    }
+    logln(F("오른쪽 막힘 → 왼쪽 180도"));
+    enterState(ST_TURN_LEFT_180);
   }
 }
 
-void handleSweepSettle() {
-  if (millis() - stateStartMs < SWEEP_SETTLE_MS) {
-    return;
+/*
+  왼쪽 180도:
+  오른쪽으로 90도 돌아있는 상태에서 왼쪽으로 180도 돌면
+  정면 복귀(90도) + 왼쪽 탐색(90도)을 한번에 처리.
+  회전 횟수 줄여서 누적 오차 감소.
+*/
+void handleTurnLeft180() {
+  pivotLeft();
+  if (millis() - stateStartMs >= PIVOT_180_MS) {
+    stopMotor();
+    enterState(ST_CHECK_LEFT);
   }
-
-  int d = filteredDistance;
-
-  if (peakMode) {
-    peakStepCount++;
-
-    bool distanceFell = (d < prevDistance);
-    bool peakLimitHit = (peakStepCount >= PEAK_MAX_STEPS);
-
-#if DEBUG_SERIAL
-    Serial.print(F("[피크탐색] 현재="));
-    Serial.print(d);
-    Serial.print(F(" 이전="));
-    Serial.print(prevDistance);
-    Serial.print(F(" 피크스텝="));
-    Serial.println(peakStepCount);
-
-    BT.print(F("[피크탐색] 현재="));
-    BT.print(d);
-    BT.print(F(" 이전="));
-    BT.print(prevDistance);
-    BT.print(F(" 피크스텝="));
-    BT.println(peakStepCount);
-#endif
-
-    if (distanceFell || peakLimitHit) {
-      if (distanceFell) {
-        debugEvent(F("피크 확인 -> 탈출"));
-      } else {
-        debugEvent(F("피크 탐색 한계 -> 탈출"));
-      }
-
-      triedBothDirections = false;
-      escapeDir = sweepDir;  // 탈출 성공 방향 기억
-      enterState(ST_ESCAPE_FORWARD);
-      return;
-    
-    }
-
-    prevDistance = d;
-    enterState(ST_SWEEP);
-    return;
-  }
-
-  sweepStepCount++;
-
-  if (d >= CLEAR_DISTANCE) {
-    peakMode      = true;
-    peakStepCount = 0;
-    prevDistance  = d;
-    bestDistance  = d;
-
-    debugEvent(F("CLEAR 첫 감지 -> 피크 탐색 시작"));
-    enterState(ST_SWEEP);
-    return;
-  }
-
-  if (sweepStepCount < MAX_SWEEP_STEPS) {
-    enterState(ST_SWEEP);
-    return;
-  }
-
-  if (!triedBothDirections) {
-    triedBothDirections = true;
-    debugEvent(F("현재 방향 소진 -> 반대 방향"));
-    beginNextHalf();
-    return;
-  }
-
-  triedBothDirections = false;
-  debugEvent(F("양쪽 소진 -> 후진 재시도"));
-  enterState(ST_STOP_BEFORE_BACK);
 }
 
-void handleEscapeForward() {
+void handleCheckLeft() {
+  stopMotor();
+  if (millis() - stateStartMs < CHECK_SETTLE_MS) return;
+  if (filteredDistance >= CLEAR_DISTANCE) {
+    logln(F("왼쪽 길 발견 → 직진"));
+    enterState(ST_ESCAPE_FWD);
+  } else {
+    logln(F("왼쪽도 막힘 → 유턴"));
+    enterState(ST_UTURN);
+  }
+}
+
+/*
+  유턴: 현재 왼쪽을 보고 있으므로 왼쪽으로 90도 한번 더.
+  총 270도 회전한 셈 = 원래 방향에서 오른쪽으로 90도
+  = 왔던 길 방향
+*/
+void handleUturn() {
+  pivotLeft();
+
+  if (millis() - stateStartMs >= PIVOT_90_MS) {
+    stopMotor();
+    logln(F("유턴 완료 → 직진 (왔던 길)"));
+    enterState(ST_ESCAPE_FWD);
+  }
+}
+
+/*
+  탈출 전진.
+  ESCAPE_FWD_MS 동안 전진 후 일반 주행 복귀.
+  전진 중에도 DANGER 감지하면 즉시 정지 후 재탐색.
+*/
+void handleEscapeFwd() {
   if (filteredDistance <= DANGER_DISTANCE) {
     stopMotor();
-    debugEvent(F("탈출 중 장애물 재감지"));
-    enterState(ST_STOP_BEFORE_BACK);
+    logln(F("탈출 중 장애물 감지 → 정지"));
+    enterState(ST_STOP);
     return;
   }
 
   setMotor(DRIVE_SPEED, DRIVE_SPEED);
 
-  if (millis() - stateStartMs >= ESCAPE_FORWARD_MS) {
-    cruiseStartMs = 0;  // CRUISE 진입 전 타이머 초기화
+  if (millis() - stateStartMs >= ESCAPE_FWD_MS) {
     enterState(ST_CRUISE);
   }
 }
 
 // =======================================================
-// 19. 모터 제어
+// 17. 피벗 제어
+// =======================================================
+
+/*
+  pivotRight: 오른쪽 방향으로 차체를 돌린다.
+    왼쪽 바퀴 전진 + 오른쪽 바퀴 후진
+
+  pivotLeft: 왼쪽 방향으로 차체를 돌린다.
+    오른쪽 바퀴 전진 + 왼쪽 바퀴 후진
+
+  트림을 우회하여 setOneMotor()를 직접 호출한다.
+  트림이 붙으면 전진/후진 간 힘 불균형이 생겨서
+  실제 회전각이 틀어진다.
+*/
+void pivotRight() {
+  setOneMotor(motorLeft,   PIVOT_SPEED, LEFT_MOTOR_INVERT);
+  setOneMotor(motorRight, -PIVOT_SPEED, RIGHT_MOTOR_INVERT);
+}
+
+void pivotLeft() {
+  setOneMotor(motorLeft,  -PIVOT_SPEED, LEFT_MOTOR_INVERT);
+  setOneMotor(motorRight,  PIVOT_SPEED, RIGHT_MOTOR_INVERT);
+}
+
+// =======================================================
+// 18. 모터 제어
 // =======================================================
 
 void setMotor(int left, int right) {
-  left  = constrain(left, MOTOR_MIN, MOTOR_MAX);
+  left  = constrain(left,  MOTOR_MIN, MOTOR_MAX);
   right = constrain(right, MOTOR_MIN, MOTOR_MAX);
 
-  left  = applyTrim(left, LEFT_TRIM);
+  left  = applyTrim(left,  LEFT_TRIM);
   right = applyTrim(right, RIGHT_TRIM);
 
-  left  = constrain(left, MOTOR_MIN, MOTOR_MAX);
+  left  = constrain(left,  MOTOR_MIN, MOTOR_MAX);
   right = constrain(right, MOTOR_MIN, MOTOR_MAX);
 
   setOneMotor(motorLeft,  left,  LEFT_MOTOR_INVERT);
@@ -637,14 +460,8 @@ void setMotor(int left, int right) {
 }
 
 int applyTrim(int speed, int trim) {
-  if (speed > 0) {
-    return speed + trim;
-  }
-
-  if (speed < 0) {
-    return speed - trim;
-  }
-
+  if (speed > 0) return speed + trim;
+  if (speed < 0) return speed - trim;
   return 0;
 }
 
@@ -658,10 +475,7 @@ void setOneMotor(AF_DCMotor &motor, int signedSpeed, uint8_t invert) {
   }
 
   bool forward = (signedSpeed > 0);
-
-  if (invert) {
-    forward = !forward;
-  }
+  if (invert) forward = !forward;
 
   motor.setSpeed(pwm);
   motor.run(forward ? FORWARD : BACKWARD);
@@ -670,85 +484,33 @@ void setOneMotor(AF_DCMotor &motor, int signedSpeed, uint8_t invert) {
 void stopMotor() {
   motorLeft.setSpeed(0);
   motorRight.setSpeed(0);
-
   motorLeft.run(RELEASE);
   motorRight.run(RELEASE);
 }
 
 // =======================================================
-// 20. 디버그
+// 19. 디버그
 // =======================================================
 
 const __FlashStringHelper *stateName(AutoState s) {
   switch (s) {
-    case ST_CRUISE:
-      return F("일반 주행");
-
-    case ST_STOP_BEFORE_BACK:
-      return F("후진 전 정지");
-
-    case ST_BACK:
-      return F("후진");
-
-    case ST_SWEEP:
-      return F("스윕 회전");
-
-    case ST_SWEEP_SETTLE:
-      return F("스윕 안정화");
-
-    case ST_ESCAPE_FORWARD:
-      return F("탈출 전진");
-
-    default:
-      return F("알 수 없음");
+    case ST_CRUISE:       return F("직진");
+    case ST_STOP:         return F("정지");
+    case ST_TURN_RIGHT:   return F("우회전 90");
+    case ST_CHECK_RIGHT:  return F("우측 확인");
+    case ST_TURN_LEFT_180: return F("좌회전 180");
+    case ST_CHECK_LEFT:    return F("좌측 확인");
+    case ST_UTURN:        return F("유턴 90");
+    case ST_ESCAPE_FWD:   return F("탈출 전진");
+    default:              return F("알 수 없음");
   }
 }
 
-void debugEvent(const __FlashStringHelper *msg) {
+void logln(const __FlashStringHelper *msg) {
 #if DEBUG_SERIAL
-  Serial.print(F("이벤트: "));
-  Serial.print(msg);
-  Serial.print(F(" 거리="));
-  Serial.print(filteredDistance);
-  Serial.print(F(" 방향="));
-  Serial.print(sweepDir == -1 ? F("L") : F("R"));
-  Serial.print(F(" 스텝="));
-  Serial.println(sweepStepCount);
-
-  BT.print(F("이벤트: "));
-  BT.print(msg);
-  BT.print(F(" 거리="));
-  BT.print(filteredDistance);
-  BT.print(F(" 방향="));
-  BT.print(sweepDir == -1 ? F("L") : F("R"));
-  BT.print(F(" 스텝="));
-  BT.println(sweepStepCount);
+  Serial.println(msg);
+  BT.println(msg);
 #else
   (void)msg;
-#endif
-}
-
-void debugPrint() {
-#if DEBUG_SERIAL
-  static unsigned long lastDebugMs = 0;
-
-  if (millis() - lastDebugMs < DEBUG_PRINT_INTERVAL_MS) {
-    return;
-  }
-
-  lastDebugMs = millis();
-
-  BT.print(F("ST="));
-  BT.print((int)state);
-  BT.print(F(" D="));
-  BT.print(filteredDistance);
-  BT.print(F(" DIR="));
-  BT.print(sweepDir == -1 ? F("L") : F("R"));
-  BT.print(F(" STP="));
-  BT.print(sweepStepCount);
-  BT.print(F(" PEAK="));
-  BT.print(peakMode ? F("Y") : F("N"));
-  BT.print(F(" RND="));
-  BT.println(sweepRound);
 #endif
 }
