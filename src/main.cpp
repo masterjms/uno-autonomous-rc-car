@@ -136,6 +136,7 @@ int dangerCount = 0;
 int sweepDir       = -1;
 int sweepStepCount = 0;
 int sweepRound     = 0;
+int sweepTargetSteps = MAX_SWEEP_STEPS;
 
 bool peakMode      = false;
 int peakStepCount  = 0;
@@ -266,6 +267,7 @@ void beginSweep() {
   }
 
   sweepStepCount = 0;
+  sweepTargetSteps = MAX_SWEEP_STEPS;
   sweepRound++;
 
   peakMode      = false;
@@ -292,7 +294,11 @@ void beginSweep() {
 // =======================================================
 
 void beginNextHalf() {
+  // 반대편 탐색 시, 현재까지 회전한 만큼을 보상해
+  // 반대편으로 충분히 회전하도록 목표 스텝을 늘린다.
+  int prevSteps = sweepStepCount;
   sweepDir       = -sweepDir;
+  sweepTargetSteps = MAX_SWEEP_STEPS + prevSteps;
   sweepStepCount = 0;
 
   peakMode      = false;
@@ -585,7 +591,7 @@ void handleSweepSettle() {
     return;
   }
 
-  if (sweepStepCount < MAX_SWEEP_STEPS) {
+  if (sweepStepCount < sweepTargetSteps) {
     enterState(ST_SWEEP);
     return;
   }
